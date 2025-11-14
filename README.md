@@ -7,8 +7,6 @@
 Ce projet est une application console en **C#** qui simule la lecture de compteurs électriques Linky via MQTT.  
 Elle permet de recevoir les données de capteurs (puissance, température, état TOR), de les traiter et de les afficher dans la console, puis de les sauvegarder périodiquement en fichiers CSV.  
 
-Cette version remplace une ancienne version Windows Forms perdue.
-
 ---
 
 ## Fonctionnement du code
