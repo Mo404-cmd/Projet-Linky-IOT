@@ -1,0 +1,438 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using uPLibrary.Networking.M2Mqtt;
+using uPLibrary.Networking.M2Mqtt.Messages;
+
+namespace ClientMQTTBase
+{
+    // Classe pour stocker les données du compteur
+    class CompteurData
+    {
+        public string Nom { get; set; } // Nom du compteur
+        public List<int> PuissanceList { get; set; } // Liste des valeurs de puissance
+        public double Temperature { get; set; } // Température mesurée
+        public int EtatTOR { get; set; } // État TOR (Tout ou Rien)
+        public int PuissanceMin { get; set; } // Puissance minimale
+        public int PuissanceMax { get; set; } // Puissance maximale
+    }
+
+    // Classe principale du programme LINKY IIOT
+    class Program
+    {
+        // Variables globales
+        static List<CompteurData> Compteurs = new List<CompteurData>(); // Liste des compteurs
+        static string ServeurMqtt; // Adresse du broker MQTT
+        static string Compteur; // Nom des compteurs configurés
+        static string[] CompteursConfig; // Tableau des compteurs configurés
+        static string cheminConf; // Chemin du fichier de configuration
+        static string cheminSave; // Chemin des sauvegardes
+        static string NomFichier = "TestParam.txt"; // Nom du fichier de configuration
+        static string CompteurActuel; // Topic du compteur actuel
+        static int NbMoy; // Nombre de valeurs pour la moyenne glissante
+        static int Tempo; // Délai entre deux sauvegardes en millisecondes
+        static bool ValeurRecue = false; // Indique si une valeur a été reçue
+        static bool erreurSauvegarde = false; // Indique une erreur lors de la sauvegarde
+
+        // Fonction d'initialisation du programme
+        static void Init()
+        {
+            string Broker, Topic, Temps, Moy;
+
+            try
+            {
+                StreamReader reader = new StreamReader(cheminConf + NomFichier);
+
+                // Vérifier si le fichier est vide
+                if (reader.Peek() == -1)
+                {
+                    Console.WriteLine("Le fichier de configuration est vide.");
+                    reader.Close();
+                    Environment.Exit(0);
+                }
+
+                // Lecture des paramètres depuis le fichier
+                Broker = reader.ReadLine();
+                Topic = reader.ReadLine();
+                Temps = reader.ReadLine();
+                Moy = reader.ReadLine();
+
+                // Vérification de la complétude du fichier
+                if (Broker == null || Topic == null || Temps == null || Moy == null)
+                {
+                    Console.WriteLine("Le fichier de configuration est incomplet.");
+                    reader.Close();
+                    Environment.Exit(0);
+                }
+
+                // Vérification que les valeurs numériques sont valides
+                if (!int.TryParse(Temps, out _))
+                {
+                    Console.WriteLine("La valeur du temps n'est pas un nombre valide.");
+                    reader.Close();
+                    Environment.Exit(0);
+                }
+
+                if (!int.TryParse(Moy, out _))
+                {
+                    Console.WriteLine("La valeur de la moyenne n'est pas un nombre valide.");
+                    reader.Close();
+                    Environment.Exit(0);
+                }
+
+                // Initialisation des variables globales
+                Compteur = Topic;
+                ServeurMqtt = Broker;
+                Tempo = Convert.ToInt32(Temps) * 1000; // Conversion en millisecondes
+                NbMoy = Convert.ToInt32(Moy);
+                CompteursConfig = Topic.Split(';'); // Séparation des compteurs configurés
+                reader.Close();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Erreur lors de la lecture du fichier de configuration : " + ex.Message);
+                Console.WriteLine("Le programme va maintenant se terminer.");
+                Environment.Exit(0);
+            }
+        }
+
+        // Établit la connexion MQTT et s'abonne aux topics
+        static bool ConnexionAbonnementMqtt()
+        {
+            Console.WriteLine("Connexion à " + ServeurMqtt);
+            try
+            {
+                MqttClient client = new MqttClient(ServeurMqtt);
+
+                string clientId = Guid.NewGuid().ToString(); // Génération d'un clientId unique
+                client.Connect(clientId); // Connexion au broker
+
+                if (client.IsConnected)
+                    Console.WriteLine("Connecté");
+                else
+                    return false;
+
+                // Définition du topic et du QoS
+                String[] LesTopics = new string[1];
+                byte[] ServiceRequis = new byte[1];
+
+                LesTopics[0] = "GeiiNancy/Compteurs/#"; // Souscription à tous les compteurs
+                ServiceRequis[0] = MqttMsgBase.QOS_LEVEL_AT_MOST_ONCE;
+
+                client.MqttMsgPublishReceived += Client_MqttMsgPublishReceived; // Gestion des messages reçus
+                client.Subscribe(LesTopics, ServiceRequis); // Souscription aux topics
+
+                // Affichage des informations sur le broker et les compteurs
+                Console.Write($"    - Nom du broker : ");
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.Write($"{ServeurMqtt}");
+                Console.ResetColor();
+                Console.WriteLine("");
+                Console.WriteLine($"    - Nom de(s) compteur(s) valide(s) :");
+                foreach (string compteur in CompteursConfig)
+                {
+                    Console.ForegroundColor = ConsoleColor.White;
+                    Console.Write("         - ");
+
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"{compteur}");
+
+                    Console.ResetColor();
+                }
+
+                Console.Write($"    - Le délai de sauvegarde est : ");
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.Write($"{Tempo / 1000}");
+                Console.ResetColor();
+                Console.Write($" seconde(s)");
+
+                Console.WriteLine("");
+
+                Console.Write($"    - Le nombre de valeurs de la moyenne glissante est : ");
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.Write($"{NbMoy}");
+                Console.ResetColor();
+                Console.WriteLine("");
+                Console.ResetColor();
+                return true;
+            }
+            catch
+            {
+                return false; // Retourne false si la connexion échoue
+            }
+        }
+
+        // Vérifie si un compteur est valide
+        static bool EstCompteurValide(string compteur)
+        {
+            return CompteursConfig.Contains(compteur); // Vérifie si le compteur fait partie de la configuration
+        }
+
+        // Effectue la sauvegarde périodique des données des compteurs
+        static void SauvegardePeriodique()
+        {
+            try
+            {
+                string dossierPrincipal = Path.Combine(cheminSave, "Sauvegardes");
+                Directory.CreateDirectory(dossierPrincipal); // Création du dossier si inexistant
+
+                foreach (var compteur in Compteurs)
+                {
+                    if (compteur.PuissanceList.Any() && EstCompteurValide(compteur.Nom))
+                    {
+                        string fichierCompt = Path.Combine(dossierPrincipal, $"{compteur.Nom}.csv");
+
+                        // Création du fichier si inexistant
+                        if (!File.Exists(fichierCompt))
+                        {
+                            using (StreamWriter writer = File.CreateText(fichierCompt))
+                            {
+                                writer.WriteLine("DateHeure;Temperature;Puissance;ETor"); // En-tête du CSV
+                            }
+                        }
+
+                        DateTime dateHeure = DateTime.Now;
+                        string formattedDate = dateHeure.ToString("dd/MM/yyyy HH:mm");
+
+                        // Écriture des données dans le fichier
+                        using (StreamWriter writer = File.AppendText(fichierCompt))
+                        {
+                            writer.WriteLine($"{formattedDate};{compteur.Temperature};{compteur.PuissanceList.Last()};{compteur.EtatTOR}");
+                        }
+
+                        Console.WriteLine("Sauvegarde effectuée");
+                        Console.WriteLine($"Vos sauvegardes se trouvent à cet emplacement : {dossierPrincipal}");
+
+                        // Réinitialiser l'état de l'erreur après une sauvegarde réussie
+                        erreurSauvegarde = false;
+                    }
+                }
+            }
+            catch
+            {
+                // En cas d'erreur, indiquer qu'une sauvegarde a échoué
+                erreurSauvegarde = true;
+            }
+        }
+
+        // Filtre les compteurs en fonction des paramètres de configuration
+        static bool Filtrage()
+        {
+            string ListeCompteur = Compteur;
+            string[] CompteurValide = ListeCompteur.Split(';');
+
+            if (CompteurActuel != null)
+            {
+                string ListeCompteuractu = CompteurActuel;
+                string[] CompteurPublie = ListeCompteuractu.Split('/');
+
+                // Vérification que le compteur publié est dans la liste des compteurs valides
+                foreach (string compteurValide in CompteurValide)
+                {
+                    if (CompteurPublie[2] == compteurValide)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Gestion de la réception des messages MQTT
+        static void Client_MqttMsgPublishReceived(object sender, MqttMsgPublishEventArgs e)
+        {
+            String Contenu = Encoding.ASCII.GetString(e.Message); // Conversion du message en texte
+
+            string[] TopicSplit = e.Topic.Split('/');
+            if (TopicSplit.Length == 3 && EstCompteurValide(TopicSplit[2]))
+            {
+                CompteurActuel = e.Topic;
+                String NomCompteur = TopicSplit[2];
+                String[] ContenuSplit = Contenu.Split(';');
+
+                if (ContenuSplit.Length >= 2)
+                {
+                    // Récupération de la puissance
+                    if (int.TryParse(ContenuSplit[0], out int Puissance))
+                    {
+                        // Récupération de la température
+                        if (double.TryParse(ContenuSplit[1], NumberStyles.Any, CultureInfo.InvariantCulture, out double Temperature))
+                        {
+                            if (int.TryParse(ContenuSplit[2], out int TOR))
+                            {
+                                // Recherche du compteur dans la liste
+                                var compteur = Compteurs.FirstOrDefault(c => c.Nom == NomCompteur);
+                                if (compteur == null)
+                                {
+                                    ValeurRecue = true;
+                                    compteur = new CompteurData
+                                    {
+                                        Nom = NomCompteur,
+                                        PuissanceList = new List<int>(),
+                                        PuissanceMin = int.MaxValue,
+                                        PuissanceMax = int.MinValue
+                                    };
+                                    Compteurs.Add(compteur);
+                                }
+
+                                // Ajout de la nouvelle puissance à la liste
+                                compteur.PuissanceList.Add(Puissance);
+
+                                // Limitation de la liste pour la moyenne glissante
+                                if (compteur.PuissanceList.Count > NbMoy) compteur.PuissanceList.RemoveAt(0);
+
+                                // Mise à jour des valeurs min et max
+                                int puissanceMinLocal = compteur.PuissanceList.Min();
+                                int puissanceMaxLocal = compteur.PuissanceList.Max();
+
+                                compteur.PuissanceMin = Math.Min(compteur.PuissanceMin, puissanceMinLocal);
+                                compteur.PuissanceMax = Math.Max(compteur.PuissanceMax, puissanceMaxLocal);
+                                compteur.Temperature = Temperature; // Mise à jour de la température
+                                compteur.EtatTOR = TOR;
+                                Affichage(); // Rafraîchissement de l'affichage
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine("Erreur dans les données envoyées");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Calcul de la moyenne glissante
+        static double CalculerMoyenneGlissante(List<int> puissanceList)
+        {
+            if (puissanceList.Count < NbMoy || NbMoy == 0)
+            {
+                Console.WriteLine($"Pour la moyenne {NbMoy} valeurs minimum sont nécessaires");
+                return 0.0;
+            }
+
+            double somme = 0.0;
+            for (int i = puissanceList.Count - NbMoy; i < puissanceList.Count; i++)
+            {
+                somme += puissanceList[i];
+            }
+
+            return somme / NbMoy; // Retour de la moyenne glissante
+        }
+
+        // Affichage des données des compteurs
+        static void Affichage()
+        {
+            Console.Clear();
+
+            // Affichage de l'en-tête du tableau
+            Console.WriteLine("╔═════════════════╦═══════════╦═════════╦══════════╗");
+            Console.WriteLine("║    Compteur     ║  Moyenne  ║   Min   ║    Max   ║");
+            Console.WriteLine("╠═════════════════╬═══════════╬═════════╬══════════╣");
+
+            // Affichage des données pour chaque compteur
+            foreach (var compteur in Compteurs)
+            {
+                bool compteurValide = EstCompteurValide(compteur.Nom);
+                if (compteurValide)
+                {
+                    double moyenne = CalculerMoyenneGlissante(compteur.PuissanceList);
+                    int min = compteur.PuissanceMin;
+                    int max = compteur.PuissanceMax;
+
+                    string formattedRow = $"║ {compteur.Nom,-15} ║ {moyenne.ToString("0.00"),-9} ║ {min,-7} ║ {max,-8} ║";
+                    Console.WriteLine(formattedRow);
+                }
+            }
+
+            Console.WriteLine("╚═════════════════╩═══════════╩═════════╩══════════╝");
+
+            // Message en cas d'erreur de sauvegarde
+            if (erreurSauvegarde)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("Sauvegarde impossible \nMerci de fermer le fichier de sauvegarde");
+                Console.ResetColor();
+            }
+        }
+
+        // Fonction principale
+        static void Main(string[] args)
+        {
+            // Affichage du message de bienvenue et décoration ASCII
+            Console.Clear();
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("╔══════════════════════════════════════════════════════════════════════════════════════════════════╗");
+            // ... (reste du message ASCII)
+            Console.ResetColor();
+            Console.WriteLine("");
+
+            // Demande du chemin de configuration
+            Console.WriteLine("\nVeuillez saisir le chemin pour accéder au fichier de configuration : ");
+            cheminConf = Console.ReadLine();
+
+            // Validation du chemin utilisateur
+            while (string.IsNullOrEmpty(cheminConf) || string.IsNullOrWhiteSpace(cheminConf) || !Directory.Exists(cheminConf) || cheminConf.Trim().Length == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("Le chemin fourni est invalide. Assurez-vous que le répertoire existe.");
+                Console.ResetColor();
+                Console.Write("Veuillez saisir un chemin valide : ");
+                cheminConf = Console.ReadLine();
+            }
+
+            // Choix du chemin de sauvegarde
+            Console.WriteLine("Souhaitez-vous choisir l'emplacement de vos sauvegardes (O/N) ?");
+            string rep = Console.ReadLine();
+            if (rep.ToUpper() == "O")
+            {
+                Console.WriteLine("Merci de saisir le chemin souhaité : ");
+                cheminSave = Console.ReadLine();
+            }
+            else
+            {
+                cheminSave = AppDomain.CurrentDomain.BaseDirectory; // Par défaut, le répertoire de l'exécutable
+            }
+
+            // Ajout du '\' final si nécessaire
+            if (!cheminConf.EndsWith("\\")) cheminConf += "\\";
+            if (!cheminSave.EndsWith("\\")) cheminSave += "\\";
+
+            // Validation du chemin de sauvegarde
+            while (string.IsNullOrEmpty(cheminSave) || string.IsNullOrWhiteSpace(cheminSave) || !Directory.Exists(cheminSave))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("Le chemin fourni est invalide. Assurez-vous que le répertoire existe.");
+                Console.ResetColor();
+                Console.Write("Veuillez saisir un chemin valide : ");
+                cheminSave = Console.ReadLine();
+            }
+
+            // Affichage de la confirmation de configuration
+            Console.Clear();
+            Console.WriteLine("╔═════════════════════════════════════════════╗");
+            Console.WriteLine("║     Configuration chargée avec succès !     ║");
+            Console.WriteLine("║           En attente de valeurs...          ║");
+            Console.WriteLine("╚═════════════════════════════════════════════╝");
+
+            // Initialisation et connexion au broker MQTT
+            Init();
+            ConnexionAbonnementMqtt();
+            Filtrage();
+
+            // Boucle principale
+            while (true)
+            {
+                if (ValeurRecue)
+                {
+                    Thread.Sleep(Tempo);
+                    SauvegardePeriodique();
+                }
+                else Thread.Sleep(1000); // Attente si aucune valeur reçue
+            }
+        }
+    }
+}
