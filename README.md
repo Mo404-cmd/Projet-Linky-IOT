@@ -1,5 +1,7 @@
 # Projet-Linky-IOT
 
+---
+
 ## Description
 
 Ce projet est une application console en **C#** qui simule la lecture de compteurs électriques Linky via MQTT.  
